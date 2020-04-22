@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/kops/upup/pkg/fi"
@@ -30,6 +31,15 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"k8s.io/klog"
 )
+
+type LaunchTemplatesVersionsCache struct {
+	Items []*ec2.LaunchTemplateVersion
+	sync.RWMutex
+}
+
+var ltvCache = &LaunchTemplatesVersionsCache{
+	RWMutex: sync.RWMutex{},
+}
 
 // RenderAWS is responsible for performing creating / updating the launch template
 func (t *LaunchTemplate) RenderAWS(c *awsup.AWSAPITarget, a, ep, changes *LaunchTemplate) error {
@@ -146,6 +156,8 @@ func (t *LaunchTemplate) RenderAWS(c *awsup.AWSAPITarget, a, ep, changes *Launch
 	}
 
 	ep.ID = fi.String(name)
+
+	ltvCache.Reset()
 
 	return nil
 }
@@ -289,8 +301,6 @@ func (t *LaunchTemplate) findAllLaunchTemplates(c *fi.Context) ([]*ec2.LaunchTem
 
 // findAllLaunchTemplateVersions returns all the launch templates versions for us
 func (t *LaunchTemplate) findAllLaunchTemplatesVersions(c *fi.Context) ([]*ec2.LaunchTemplateVersion, error) {
-	var list []*ec2.LaunchTemplateVersion
-
 	cloud, ok := c.Cloud.(awsup.AWSCloud)
 	if !ok {
 		return []*ec2.LaunchTemplateVersion{}, fmt.Errorf("invalid cloud provider: %v, expected: awsup.AWSCloud", c.Cloud)
@@ -301,30 +311,35 @@ func (t *LaunchTemplate) findAllLaunchTemplatesVersions(c *fi.Context) ([]*ec2.L
 		return nil, err
 	}
 
-	var next *string
-	for _, x := range templates {
-		err := func() error {
-			for {
-				resp, err := cloud.EC2().DescribeLaunchTemplateVersions(&ec2.DescribeLaunchTemplateVersionsInput{
-					LaunchTemplateName: x.LaunchTemplateName,
-					NextToken:          next,
-				})
-				if err != nil {
-					return err
-				}
-				for _, x := range resp.LaunchTemplateVersions {
-					list = append(list, x)
-				}
-				if resp.NextToken == nil {
-					return nil
+	if ltvCache.Items == nil {
+		ltvCache.Lock()
+
+		if ltvCache.Items == nil {
+			request := &ec2.DescribeLaunchTemplateVersionsInput{}
+			err := cloud.EC2().DescribeLaunchTemplateVersionsPages(request, func(p *ec2.DescribeLaunchTemplateVersionsOutput, lastPage bool) bool {
+				for _, v := range p.LaunchTemplateVersions {
+					ltvCache.Items = append(ltvCache.Items, v)
 				}
 
-				next = resp.NextToken
+				return true
+			})
+			if err != nil {
+				ltvCache.Reset()
+				ltvCache.Unlock()
+
+				return nil, err
 			}
-		}()
-		if err != nil {
-			return nil, err
 		}
+
+		ltvCache.Unlock()
+	}
+
+	var list []*ec2.LaunchTemplateVersion
+
+	for _, x := range templates {
+		ltvCache.RLock()
+		list = append(list, ltvCache.GetEntries(x.LaunchTemplateName)...)
+		ltvCache.RUnlock()
 	}
 
 	return list, nil
@@ -407,10 +422,35 @@ func (d *deleteLaunchTemplate) Delete(t fi.Target) error {
 		return fmt.Errorf("error deleting LaunchTemplate %s: error: %s", d.Item(), err)
 	}
 
+	// Reset our cache so the next request pulls down a fresh list
+	ltvCache.Reset()
+
 	return nil
 }
 
 // String returns a string representation of the task
 func (d *deleteLaunchTemplate) String() string {
 	return d.TaskName() + "-" + d.Item()
+}
+
+func (c *LaunchTemplatesVersionsCache) GetEntries(launchTemplateName *string) []*ec2.LaunchTemplateVersion {
+	var versions []*ec2.LaunchTemplateVersion
+
+	c.RLock()
+
+	for _, v := range c.Items {
+		if aws.StringValue(v.LaunchTemplateName) == aws.StringValue(launchTemplateName) {
+			versions = append(versions, v)
+		}
+	}
+
+	c.RUnlock()
+
+	return versions
+}
+
+func (c *LaunchTemplatesVersionsCache) Reset() {
+	c.Lock()
+	c.Items = nil
+	c.Unlock()
 }
