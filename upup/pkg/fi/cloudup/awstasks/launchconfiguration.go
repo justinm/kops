@@ -22,6 +22,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/kops/pkg/featureflag"
@@ -89,6 +90,15 @@ type LaunchConfiguration struct {
 	UserData *fi.ResourceHolder
 }
 
+type LaunchConfigurationCache struct {
+	Items []*autoscaling.LaunchConfiguration
+	sync.RWMutex
+}
+
+var lcCache = &LaunchConfigurationCache{
+	RWMutex: sync.RWMutex{},
+}
+
 var _ fi.CompareWithID = &LaunchConfiguration{}
 
 var _ fi.ProducesDeletions = &LaunchConfiguration{}
@@ -101,37 +111,46 @@ func (e *LaunchConfiguration) CompareWithID() *string {
 func (e *LaunchConfiguration) findLaunchConfigurations(c *fi.Context) ([]*autoscaling.LaunchConfiguration, error) {
 	cloud := c.Cloud.(awsup.AWSCloud)
 
-	request := &autoscaling.DescribeLaunchConfigurationsInput{}
+	if lcCache.Items == nil {
+		lcCache.Lock()
+
+		// check the cache again in case it was generated prior to our lock being acquired
+		if lcCache.Items == nil {
+			request := &autoscaling.DescribeLaunchConfigurationsInput{}
+
+			err := cloud.Autoscaling().DescribeLaunchConfigurationsPages(request, func(page *autoscaling.DescribeLaunchConfigurationsOutput, lastPage bool) bool {
+				for _, l := range page.LaunchConfigurations {
+					lcCache.Items = append(lcCache.Items, l)
+				}
+
+				return true
+			})
+			if err != nil {
+				lcCache.Items = nil
+				lcCache.Unlock()
+
+				return nil, fmt.Errorf("error listing AutoscalingLaunchConfigurations: %v", err)
+			}
+
+			sort.Slice(lcCache.Items, func(i, j int) bool {
+				ti := lcCache.Items[i].CreatedTime
+				tj := lcCache.Items[j].CreatedTime
+				if tj == nil {
+					return true
+				}
+				if ti == nil {
+					return false
+				}
+				return ti.UnixNano() < tj.UnixNano()
+			})
+		}
+
+		lcCache.Unlock()
+	}
 
 	prefix := *e.Name + "-"
 
-	var configurations []*autoscaling.LaunchConfiguration
-	err := cloud.Autoscaling().DescribeLaunchConfigurationsPages(request, func(page *autoscaling.DescribeLaunchConfigurationsOutput, lastPage bool) bool {
-		for _, l := range page.LaunchConfigurations {
-			name := aws.StringValue(l.LaunchConfigurationName)
-			if strings.HasPrefix(name, prefix) {
-				configurations = append(configurations, l)
-			}
-		}
-		return true
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error listing AutoscalingLaunchConfigurations: %v", err)
-	}
-
-	sort.Slice(configurations, func(i, j int) bool {
-		ti := configurations[i].CreatedTime
-		tj := configurations[j].CreatedTime
-		if tj == nil {
-			return true
-		}
-		if ti == nil {
-			return false
-		}
-		return ti.UnixNano() < tj.UnixNano()
-	})
-
-	return configurations, nil
+	return lcCache.GetEntries(prefix), nil
 }
 
 // Find is responsible for finding the launch configuration
@@ -372,6 +391,8 @@ func (_ *LaunchConfiguration) RenderAWS(t *awsup.AWSAPITarget, a, e, changes *La
 	}
 
 	e.ID = fi.String(launchConfigurationName)
+
+	lcCache.Reset()
 
 	return nil // No tags on a launch configuration
 }
@@ -743,6 +764,9 @@ func (d *deleteLaunchConfiguration) Delete(t fi.Target) error {
 		return fmt.Errorf("error deleting autoscaling LaunchConfiguration %s: %v", name, err)
 	}
 
+	// we need to reset our cache when a launch configuration is deleted
+	lcCache.Reset()
+
 	return nil
 }
 
@@ -752,6 +776,9 @@ func (d *deleteLaunchConfiguration) String() string {
 
 func (e *LaunchConfiguration) FindDeletions(c *fi.Context) ([]fi.Deletion, error) {
 	var removals []fi.Deletion
+
+	// we need to reset our cache and retrieve a refresh set of launch configurations from AWS
+	lcCache.Reset()
 
 	configurations, err := e.findLaunchConfigurations(c)
 	if err != nil {
@@ -771,4 +798,26 @@ func (e *LaunchConfiguration) FindDeletions(c *fi.Context) ([]fi.Deletion, error
 	klog.V(2).Infof("will delete launch configurations: %v", removals)
 
 	return removals, nil
+}
+
+func (c *LaunchConfigurationCache) GetEntries(prefix string) []*autoscaling.LaunchConfiguration {
+	var configs []*autoscaling.LaunchConfiguration
+
+	c.RLock()
+	defer c.RUnlock()
+
+	for _, l := range c.Items {
+		name := aws.StringValue(l.LaunchConfigurationName)
+		if strings.HasPrefix(name, prefix) {
+			configs = append(configs, l)
+		}
+	}
+
+	return configs
+}
+
+func (c *LaunchConfigurationCache) Reset() {
+	c.Lock()
+	c.Items = nil
+	c.Unlock()
 }
