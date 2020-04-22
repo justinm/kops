@@ -1163,12 +1163,38 @@ func describeVPC(c AWSCloud, vpcID string) (*ec2.Vpc, error) {
 	return vpc, nil
 }
 
+type ImageCache struct {
+	Items map[string]*ec2.Image
+	sync.RWMutex
+}
+
+var iCache = &ImageCache{
+	RWMutex: sync.RWMutex{},
+}
+
 // ResolveImage finds an AMI image based on the given name.
 // The name can be one of:
 // `ami-...` in which case it is presumed to be an id
 // owner/name in which case we find the image with the specified name, owned by owner
 // name in which case we find the image with the specified name, with the current owner
 func (c *awsCloudImplementation) ResolveImage(name string) (*ec2.Image, error) {
+	var image *ec2.Image
+
+	image = iCache.GetEntry(name)
+
+	if image == nil {
+		iCache.Lock()
+		defer iCache.Unlock()
+
+		image, err := resolveImage(c.ec2, name)
+		if err != nil {
+			return nil, err
+		}
+		iCache.Items[name] = image
+
+		return image, nil
+	}
+
 	return resolveImage(c.ec2, name)
 }
 
@@ -1434,4 +1460,13 @@ func (c *awsCloudImplementation) zonesWithInstanceType(instanceType string) (set
 	}
 
 	return zones, nil
+}
+
+func (c *ImageCache) GetEntry(name string) *ec2.Image {
+	c.RLock()
+	defer c.RUnlock()
+
+	res, _ := iCache.Items[name]
+
+	return res
 }
