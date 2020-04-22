@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 
 	"k8s.io/kops/upup/pkg/fi"
 	"k8s.io/kops/upup/pkg/fi/cloudup/awsup"
@@ -82,6 +83,15 @@ type AutoscalingGroup struct {
 	SuspendProcesses *[]string
 	// Tags is a collection of keypairs to apply to the node on launch
 	Tags map[string]string
+}
+
+type AutoscalingGroupCache struct {
+	Items []*autoscaling.Group
+	sync.RWMutex
+}
+
+var asgCache = &AutoscalingGroupCache{
+	RWMutex: sync.RWMutex{},
 }
 
 var _ fi.CompareWithID = &AutoscalingGroup{}
@@ -182,32 +192,39 @@ func (e *AutoscalingGroup) Find(c *fi.Context) (*AutoscalingGroup, error) {
 
 // findAutoscalingGroup is responsilble for finding all the autoscaling groups for us
 func findAutoscalingGroup(cloud awsup.AWSCloud, name string) (*autoscaling.Group, error) {
-	request := &autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []*string{&name},
-	}
+	if asgCache.Items == nil {
+		asgCache.Lock()
 
-	var found []*autoscaling.Group
-	err := cloud.Autoscaling().DescribeAutoScalingGroupsPages(request, func(p *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) (shouldContinue bool) {
-		for _, g := range p.AutoScalingGroups {
-			// Check for "Delete in progress" (the only use .Status). We won't be able to update or create while
-			// this is true, but filtering it out here makes the messages slightly clearer.
-			if g.Status != nil {
-				klog.Warningf("Skipping AutoScalingGroup %v: %v", fi.StringValue(g.AutoScalingGroupName), fi.StringValue(g.Status))
-				continue
-			}
+		// check the cache again in case it was created prior to our lock being acquired, if not fill it
+		if asgCache.Items == nil {
+			request := &autoscaling.DescribeAutoScalingGroupsInput{}
 
-			if aws.StringValue(g.AutoScalingGroupName) == name {
-				found = append(found, g)
-			} else {
-				klog.Warningf("Got ASG with unexpected name %q", fi.StringValue(g.AutoScalingGroupName))
+			err := cloud.Autoscaling().DescribeAutoScalingGroupsPages(request, func(p *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) (shouldContinue bool) {
+				for _, g := range p.AutoScalingGroups {
+					// Check for "Delete in progress" (the only use .Status). We won't be able to update or create while
+					// this is true, but filtering it out here makes the messages slightly clearer.
+					if g.Status != nil {
+						klog.Warningf("Skipping AutoScalingGroup %v: %v", fi.StringValue(g.AutoScalingGroupName), fi.StringValue(g.Status))
+						continue
+					}
+
+					asgCache.Items = append(asgCache.Items, g)
+				}
+
+				return true
+			})
+			if err != nil {
+				asgCache.Items = nil
+				asgCache.Unlock()
+
+				return nil, fmt.Errorf("error listing AutoscalingGroups: %v", err)
 			}
 		}
 
-		return true
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error listing AutoscalingGroups: %v", err)
+		asgCache.Unlock()
 	}
+
+	found := asgCache.GetEntries(name)
 
 	switch len(found) {
 	case 0:
@@ -489,6 +506,8 @@ func (v *AutoscalingGroup) RenderAWS(t *awsup.AWSAPITarget, a, e, changes *Autos
 			}
 		}
 	}
+
+	asgCache.Reset()
 
 	return nil
 }
@@ -882,4 +901,26 @@ func (_ *AutoscalingGroup) RenderCloudformation(t *cloudformation.Cloudformation
 // CloudformationLink is adds a reference
 func (e *AutoscalingGroup) CloudformationLink() *cloudformation.Literal {
 	return cloudformation.Ref("AWS::AutoScaling::AutoScalingGroup", fi.StringValue(e.Name))
+}
+
+func (c *AutoscalingGroupCache) GetEntries(name string) []*autoscaling.Group {
+	var groups []*autoscaling.Group
+
+	c.RLock()
+
+	for _, group := range c.Items {
+		if aws.StringValue(group.AutoScalingGroupName) == name {
+			groups = append(groups, group)
+		}
+	}
+
+	c.RUnlock()
+
+	return groups
+}
+
+func (c *AutoscalingGroupCache) Reset() {
+	c.Lock()
+	c.Items = nil
+	c.Unlock()
 }
